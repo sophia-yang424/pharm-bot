@@ -69,7 +69,7 @@ class State(TypedDict):
     eval_decision: str # "final", "sql", or "tools"
     counter: int #to keep track of how many times we have gone thru the loop, to prevent infinite loops
     sql_retries: int
-
+    past_messages: list
 
 #give the llm context!! in this function, its the only one we use the llm for
 #use an f string for the context so its easier to give prompt as one long string since f string lets u insert dynamic varss as {x} inside the string
@@ -155,7 +155,8 @@ def should_continue(state: State) -> State:
 - Return "sql" if the ENTIRE question can be answered from the database (prescription counts, costs, prescriber info, drug names only)
 - Return "tools" if the ENTIRE question needs external web search — this includes drug mechanisms, side effects, drug classes, clinical info, global market data
 - Return "both" if ANY part needs the database AND any other part needs external info
-
+If the question references past messages in chat, use the context here: {state["past_messages"]}. 
+               The format is "Question:" and then the following "Answer:" is its correpsonding answer, in pairs
 Return only one of: "sql", "tools", "both"
         """
     response = llm.invoke(prompt)
@@ -177,7 +178,8 @@ Business definitions:
 - TRx means total prescriptions. In this dataset, use SUM(tot_clms) as TRx.
 - TRx share means drug TRx divided by total TRx in the selected comparison set.
 - NBRx cannot be calculated from this dataset because patient-level new-to-brand history is unavailable.
-
+If the question references past messages in chat, use the context here: {state["past_messages"]}. 
+               The format is "Question:" and then the following "Answer:" is its correpsonding answer, in pairs
 Rules:
 - Only use table partd_prescribers.
 - Only generate SELECT queries.
@@ -260,7 +262,9 @@ def search_call(state: State) -> State:
     response = tavily_search.invoke(search_query)
     answer = llm.invoke(f"""The user has asked the question {state["question"]}.
                 Based on the question, and the given search results:
-               {response}, turn this into natural language answer to the user's question. Only use the search results given, and do not make up any info that is not in the search results. If the search results do not have relevant info to answer the question, say "Based on the search results, I could not find relevant info to answer the question." """)
+               {response}, turn this into natural language answer to the user's question. Only use the search results given, and do not make up any info that is not in the search results. If the search results do not have relevant info to answer the question, say "Based on the search results, I could not find relevant info to answer the question. 
+               If the question references past messages in chat, use the context here: {state["past_messages"]}. 
+               The format is "Question:" and then the following "Answer:" is its correpsonding answer, in pairs" """)
     print("Search query:", search_query)
     print("Tavily response:", str(response)[:300])
     print("Tavily response:", str(response)[:300])
@@ -290,7 +294,9 @@ Criteria: Does this answer FULLY address every part of the user's question?
 - If more specific database (of aforementioned schema) querying would help, return "sql"  
 - ONLY return "final" if every part of the question is completely answered
  a partial answer is not sufficient, if any part of the question is not answered, then answer is not complete and you should not return final.
-"""
+If the question references past messages in chat, use the context here: {state["past_messages"]}. 
+               The format is "Question:" and then the following "Answer:" is its correpsonding answer, in pairs
+ """
     elif has_search:
          eval_prompt = f"""The user has asked the question {state["question"]}.
 Answer based on web search results: {state["search_answer"] if state["search_answer"] else ""}   
@@ -301,7 +307,9 @@ Criteria: Does this answer FULLY address every part of the user's question?
 - If more specific database (of aforementioned schema) querying would help, return "sql"  
 - ONLY return "final" if every part of the question is completely answered.
  a partial answer is not sufficient, if any part of the question is not answered, then answer is not complete and you should not return final.
-"""   
+If the question references past messages in chat, use the context here: {state["past_messages"]}. 
+               The format is "Question:" and then the following "Answer:" is its correpsonding answer, in pairs
+ """   
     elif has_sql:
          eval_prompt = f"""The user has asked the question {state["question"]}.
 Answer based on database query results: {state["answer"] if state["answer"] else ""} 
@@ -312,7 +320,9 @@ Criteria: Does this answer FULLY address every part of the user's question?
 - If more specific database (of aforementioned schema)querying would help, return "sql"  
 - ONLY return "final" if every part of the question is completely answered
  a partial answer is not sufficient, if any part of the question is not answered, then answer is not complete and you should not return final.
-"""
+If the question references past messages in chat, use the context here: {state["past_messages"]}. 
+               The format is "Question:" and then the following "Answer:" is its correpsonding answer, in pairs
+ """
     else:
         curr_answer = "No answer generated."
         return {"eval_decision": "final", "counter": state["counter"] + 1, "combined_answer": ""} #tech a bug to ever reach this state but for code to not crash just treat as final iteration with no answer
@@ -325,9 +335,12 @@ def combine_answers(state: State) -> State:
     if state.get("answer") and state.get("search_answer") and state.get("combined_answer"):
         prompt = f"""The user has asked the question {state["question"]}. The answer is currently {state.get("combined_answer")}. If you had to combine the SQL-based answer and the tool-based answer into one final answer to the user, how would you combine them?
 Combine the following two pieces of information into one final answer to the user's question. If you think one answer is more relevant to the user's question, prioritize that answer in the combined answer. If both answers have relevant info, combine the two answers in a way that is coherent and useful to the user. If one answer is not relevant and the other is, just give the relevant answer as the final answer. If neither answer is relevant, say "Based on the search results and the database query results. You can also trim parts of the answer if they are redundant or not useful. Do not just give a list of the two answers, but actually combine them into one final answer in natural language.
+If the question references past messages in chat, use the context here: {state["past_messages"]}. 
+               The format is "Question:" and then the following "Answer:" is its correpsonding answer, in pairs
 """
         response = llm.invoke(prompt)
-        return {"combined_answer": response.content.strip()}
+        response = response.content.strip()
+        return {"combined_answer": response, "past_messages": state.get("past_messages",[]) + [f"""Question: {state['question']} \n Answer: {response}"""]}
     else:
         return {}
 
