@@ -1,4 +1,5 @@
 from typing import TypedDict
+from unittest import result
 from langchain_tavily import TavilySearch
 from databricks import sql
 import os
@@ -150,8 +151,8 @@ Total number of beneficiaries/patients age 65 and older.
 def classify_question(state: State) -> State:
     return {}
 def should_continue(state: State) -> State:
-    prompt = f"""The user has asked the question {state["question"]}. Based on the question, and the given schema: {schema}, if you think the answer can be 
-        answered from querying the table, return "sql". If you think the question needs external info from a web search api call, return "tools". If you think the question needs both, return "both". Only return one of these three options as a string, and nothing else.
+    prompt = f"""The user has asked the question {state["question"]}. Based on the question, and the given schema: {schema}, if you think an answer that addresses all parts of the user's question can be 
+        answered from querying the table, return "sql". If you think to completely address the question, you need external info from a web search api call, return "tools". If you think the question needs both, return "both". Only return one of these three options as a string, and nothing else.
         """
     response = llm_with_tools.invoke(prompt)
     answer = response.content.strip().lower()
@@ -166,7 +167,8 @@ def generate_sql(state: State) -> State:
     #you can access parts of state by indexing it, but you cant update the fields just by indexing
     query = state["question"] #our query is the question field in the state typeddict
     prompt = f"""
-    You are a helpful pharmaceutical business analyst SQL assistant, turning natural language into SQL
+    You are a helpful pharmaceutical business analyst SQL assistant, turning natural language into SQL.
+    Only answer parts that you believe are answerable based on the dataset of the following schema: {schema}. If a part of the question is not answerable based on that dataset, ignore that part and do not include it in the SQL query. Only generate SQL for the parts of the question that are answerable with the given dataset.
 Business definitions:
 - TRx means total prescriptions. In this dataset, use SUM(tot_clms) as TRx.
 - TRx share means drug TRx divided by total TRx in the selected comparison set.
@@ -225,19 +227,24 @@ def generate_answer(state: State) -> State:
     into natural language.
     The SQL query used to get the resulting table is: {state["sql"]}
     Mention that tot_clms is being used to infer TRx, if needed.
+- Focus only on the parts of the question answerable from this dataset
+- Do not attempt to answer parts requiring external data
     Question: {state["question"]}
     Table: {state["result"]}
 """
     response = llm_with_tools.invoke(prompt)
+    print("sql \n")
     #response is an ai message object, for our purposes rn for backend we just need the content of the response message, but it has other fields like unique message id etc
     return {"answer": response.content.strip()}
 #nodes: each is a function that takes in state and outputs state, they can modify any part of the state
 #define graph w nodes
 def search_call(state: State) -> State:
-    response = tavily_search.invoke(state["question"])
+    search_query = llm.invoke(f"The user has asked this question:{state['question']}. Reduce this into only the components that can be answered properly with web search alone, ignore the parts that are datatset specific to the table of the following schema: {schema}").content.strip()
+    response = tavily_search.invoke(search_query)
     answer = llm_with_tools.invoke(f"""The user has asked the question {state["question"]}.
                 Based on the question, and the given search results:
                {response}, turn this into natural language answer to the user's question. Only use the search results given, and do not make up any info that is not in the search results. If the search results do not have relevant info to answer the question, say "Based on the search results, I could not find relevant info to answer the question." """)
+    print("search \n")
     return {"search_answer": answer.content.strip()}
 
 def evaluate(state: State) -> State:
@@ -245,25 +252,37 @@ def evaluate(state: State) -> State:
     if state["counter"] > counter_limit:
         return {"eval_decision": "final"}
     if state.get("search_answer") and state.get("answer"):
-        curr_answer = state["search_answer"] + state["answer"]
+        curr_answer = state["search_answer"] + " " +  state["answer"]
         eval_prompt = f"""The user has asked the question {state["question"]}.
 Here are two potential answers to the user's question, one based on querying the database of schema: {schema} and one based on using web search tools:
-Answer based on database query results: {state["answer"] if state["answer"] else "N/A"}
-Answer based on web search results: {state["search_answer"] if state["search_answer"] else "N/A"}   
+Answer based on database query results: {state["answer"] if state["answer"] else ""}
+Answer based on web search results: {state["search_answer"] if state["search_answer"] else ""}   
 If you believe the combined answer {curr_answer} is accurate and complete, return "final". 
-If you think the answer is missing critical info that could be found via either further querying the aforementioned database of schema: {schema}, return "sql". If you think the answer is missing critical info that could be found via using web search tools, return "tools". Only return one of these 3 options as a string, and nothing else.
+If you think the answer has not completely addressed all parts of the user's question or is missing critical info that could be found via either further querying the aforementioned database of schema: {schema}, return "sql". If you think the answer is missing critical info that could be found via using web search tools, return "tools". Only return one of these 3 options as a string, and nothing else.
+Criteria: Does this answer FULLY address every part of the user's question?
+- If any part of the question requires information not in the database (global data, clinical info, external context), you MUST return "tools"
+- If more specific database (of aforementioned schema) querying would help, return "sql"  
+- ONLY return "final" if every part of the question is completely answered
 """
     elif state.get("search_answer"):
          eval_prompt = f"""The user has asked the question {state["question"]}.
-Answer based on web search results: {state["search_answer"] if state["search_answer"] else "N/A"}   
+Answer based on web search results: {state["search_answer"] if state["search_answer"] else ""}   
 If you believe the combined answer is accurate and complete, return "final". 
-If you think the answer is missing critical info that could be found via either querying the database of schema: {schema}, return "sql". If you think the answer is missing critical info that could be found via further using web search tools, return "tools". Only return one of these 3 options as a string, and nothing else.
+If you think the answer has not completely addressed all parts of the user's question or is missing critical info that could be found via either querying the database of schema: {schema}, return "sql". If you think the answer is missing critical info that could be found via further using web search tools, return "tools". Only return one of these 3 options as a string, and nothing else.
+Criteria: Does this answer FULLY address every part of the user's question?
+- If any part of the question requires information not in the database (global data, clinical info, external context), you MUST return "tools"
+- If more specific database (of aforementioned schema) querying would help, return "sql"  
+- ONLY return "final" if every part of the question is completely answered
 """   
     elif state.get("answer"):
          eval_prompt = f"""The user has asked the question {state["question"]}.
-Answer based on database query results: {state["answer"] if state["answer"] else "N/A"} 
+Answer based on database query results: {state["answer"] if state["answer"] else ""} 
 If you believe the combined answer is accurate and complete, return "final". 
-If you think the answer is missing critical info that could be found via either further querying the aforementioned database of schema: {schema}, return "sql". If you think the answer is missing critical info that could be found via using web search tools, return "tools". Only return one of these 3 options as a string, and nothing else.
+If you think the answer has not completely addressed all parts of the user's question or is missing critical info that could be found via either further querying the aforementioned database of schema: {schema}, return "sql". If you think the answer is missing critical info that could be found via using web search tools, return "tools". Only return one of these 3 options as a string, and nothing else.
+Criteria: Does this answer FULLY address every part of the user's question?
+- If any part of the question requires information not in the database (global data, clinical info, external context), you MUST return "tools"
+- If more specific database (of aforementioned schema)querying would help, return "sql"  
+- ONLY return "final" if every part of the question is completely answered
 """
     else:
         curr_answer = "No answer generated."
@@ -299,17 +318,22 @@ graph = graph_builder.compile() #compiling turns it into an executable graph, we
 
 #graph.invoke is qhat actually runs the compiled graph in  the order we define nodes via edges
 if __name__ == "__main__":
-    question = input("User query about Medicare Part D Prescribers by Provider and Drug dataset: ")
-    result = graph.invoke({
-    "question": question,
-    "val_error": False,
-    "val_error_msg": "", "counter": 0
-})
+    question = input("User query: ")
+    while(question != "quit"):
+        for step in graph.stream({
+            "question": question,
+            "val_error": False,
+            "val_error_msg": "",
+            "counter": 0
+        }):
+            print(list(step.keys()))  # shows which node just finished
+        question = input("User query: ")
     #result is the state at end of execution, aka the fields passed thru whole pipeline
     print("SQL query generated:", result.get("sql", "N/A"))
     if result.get("combined_answer"):
         print("Combined answer from SQL and tools:", result.get("combined_answer"))
     else:
-        print(result.get("answer") or result.get("search_answer", "N/A"))
+        print("SQL to NL: " + result.get("answer", "N/A"))
+        print("API Search: " + result.get("search_answer", "N/A"))
 
 
