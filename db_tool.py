@@ -1,6 +1,7 @@
 import os
 import databricks.sql as sql
 import pandas as pd
+from dotenv import load_dotenv
 load_dotenv()
 hostname = os.getenv("DATABRICKS_SERVER_HOSTNAME")
 http_path = os.getenv("DATABRICKS_HTTP_PATH")
