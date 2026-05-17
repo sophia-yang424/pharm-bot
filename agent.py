@@ -56,16 +56,20 @@ tavily_search = TavilySearch(
 )
 tools = [tavily_search]
 llm_with_tools = llm.bind_tools(tools)
-
+counter_limit = 5
 class State(TypedDict):
     #a typeddict is like a dict but with specified keys and value types, it helps us keep track of what data we have in our state and what type it is
     question: str
     sql: str
     result: str
+    search_answer: str
     answer: str
+    combined_answer: str
     val_error: bool 
     val_error_msg: str 
     tool_decision: str # "sql", "tools", or "both"
+    eval_decision: str # "final", "sql", or "tools"
+    counter: int #to keep track of how many times we have gone thru the loop, to prevent infinite loops
 
 
 #give the llm context!! in this function, its the only one we use the llm for
@@ -149,7 +153,7 @@ def should_continue(state: State) -> State:
     prompt = f"""The user has asked the question {state["question"]}. Based on the question, and the given schema: {schema}, if you think the answer can be 
         answered from querying the table, return "sql". If you think the question needs external info from a web search api call, return "tools". If you think the question needs both, return "both". Only return one of these three options as a string, and nothing else.
         """
-    response = llm.invoke(prompt)
+    response = llm_with_tools.invoke(prompt)
     answer = response.content.strip().lower()
     if answer not in ["sql", "tools", "both"]:
         answer = "tools"
@@ -178,7 +182,7 @@ Rules:
 Question: {query}
 Errors: { state["val_error_msg"] if state["val_error"] else "None"}
 """
-    response = llm.invoke(prompt)
+    response = llm_with_tools.invoke(prompt)
     sql = response.content.strip()
     if sql.startswith("```"):
         sql = sql.split("\n", 1)[1]
@@ -224,17 +228,51 @@ def generate_answer(state: State) -> State:
     Question: {state["question"]}
     Table: {state["result"]}
 """
-    response = llm.invoke(prompt)
+    response = llm_with_tools.invoke(prompt)
     #response is an ai message object, for our purposes rn for backend we just need the content of the response message, but it has other fields like unique message id etc
     return {"answer": response.content.strip()}
 #nodes: each is a function that takes in state and outputs state, they can modify any part of the state
 #define graph w nodes
 def search_call(state: State) -> State:
     response = tavily_search.invoke(state["question"])
-    answer = llm.invoke(f"""The user has asked the question {state["question"]}.
+    answer = llm_with_tools.invoke(f"""The user has asked the question {state["question"]}.
                 Based on the question, and the given search results:
                {response}, turn this into natural language answer to the user's question. Only use the search results given, and do not make up any info that is not in the search results. If the search results do not have relevant info to answer the question, say "Based on the search results, I could not find relevant info to answer the question." """)
-    return {"answer": answer.content.strip()}
+    return {"search_answer": answer.content.strip()}
+
+def evaluate(state: State) -> State:
+    curr_answer = ""
+    if state["counter"] > counter_limit:
+        return {"eval_decision": "final"}
+    if state.get("search_answer") and state.get("answer"):
+        curr_answer = state["search_answer"] + state["answer"]
+        eval_prompt = f"""The user has asked the question {state["question"]}.
+Here are two potential answers to the user's question, one based on querying the database of schema: {schema} and one based on using web search tools:
+Answer based on database query results: {state["answer"] if state["answer"] else "N/A"}
+Answer based on web search results: {state["search_answer"] if state["search_answer"] else "N/A"}   
+If you believe the combined answer {curr_answer} is accurate and complete, return "final". 
+If you think the answer is missing critical info that could be found via either further querying the aforementioned database of schema: {schema}, return "sql". If you think the answer is missing critical info that could be found via using web search tools, return "tools". Only return one of these 3 options as a string, and nothing else.
+"""
+    elif state.get("search_answer"):
+         eval_prompt = f"""The user has asked the question {state["question"]}.
+Answer based on web search results: {state["search_answer"] if state["search_answer"] else "N/A"}   
+If you believe the combined answer is accurate and complete, return "final". 
+If you think the answer is missing critical info that could be found via either querying the database of schema: {schema}, return "sql". If you think the answer is missing critical info that could be found via further using web search tools, return "tools". Only return one of these 3 options as a string, and nothing else.
+"""   
+    elif state.get("answer"):
+         eval_prompt = f"""The user has asked the question {state["question"]}.
+Answer based on database query results: {state["answer"] if state["answer"] else "N/A"} 
+If you believe the combined answer is accurate and complete, return "final". 
+If you think the answer is missing critical info that could be found via either further querying the aforementioned database of schema: {schema}, return "sql". If you think the answer is missing critical info that could be found via using web search tools, return "tools". Only return one of these 3 options as a string, and nothing else.
+"""
+    else:
+        curr_answer = "No answer generated."
+        return {"eval_decision": "final", "counter": state["counter"] + 1, "combined_answer": ""} #tech a bug to ever reach this state but for code to not crash just treat as final iteration with no answer
+
+    decision = llm_with_tools.invoke(eval_prompt).content.strip().lower()
+    return {"eval_decision": decision, "counter": state["counter"] + 1, "combined_answer": curr_answer}
+def e(state: State) -> State:
+    return state["eval_decision"]
 graph_builder = StateGraph(State)
 graph_builder.add_node("classify", classify_question) 
 graph_builder.add_node("tools", search_call) 
@@ -242,18 +280,21 @@ graph_builder.add_node("generate_sql", generate_sql) # each node has a name and 
 graph_builder.add_node("validate_sql", validate_sql)
 graph_builder.add_node("execute_sql", execute_sql)
 graph_builder.add_node("generate_answer", generate_answer)
+graph_builder.add_node("eval", evaluate)
 #edges=where execution goes next after a node finishes. need a start and end edge, no start end node tho
 graph_builder.add_edge(START, "classify")
 graph_builder.add_conditional_edges("classify", should_continue, {"sql": "generate_sql", "tools": "tools", "both": "generate_sql"})
 graph_builder.add_edge("generate_sql", "validate_sql")
 graph_builder.add_conditional_edges("validate_sql", route_edge)
 graph_builder.add_edge("execute_sql", "generate_answer")    
-graph_builder.add_edge("generate_answer", END) 
-graph_builder.add_edge("tools", END) 
+graph_builder.add_edge("generate_answer", "eval") 
+graph_builder.add_edge("tools", "eval") 
+graph_builder.add_conditional_edges("eval", e, {"sql": "generate_sql", "tools": "tools", "final": END})
 #nodes have function and name, edges have beginning node and destination node, loops and conditional edges are allowed
 #graphs are collectin of edges and nodes, they define the flow of execution, they are like a blueprint for how agent proceses input and outputs final result
 
 graph = graph_builder.compile() #compiling turns it into an executable graph, we can now run it with diff inputs, initilly its justr an outline
+
 
 
 #graph.invoke is qhat actually runs the compiled graph in  the order we define nodes via edges
@@ -262,8 +303,13 @@ if __name__ == "__main__":
     result = graph.invoke({
     "question": question,
     "val_error": False,
-    "val_error_msg": ""
+    "val_error_msg": "", "counter": 0
 })
     #result is the state at end of execution, aka the fields passed thru whole pipeline
     print("SQL query generated:", result.get("sql", "N/A"))
-    print("Final answer:", result["answer"])
+    if result.get("combined_answer"):
+        print("Combined answer from SQL and tools:", result.get("combined_answer"))
+    else:
+        print(result.get("answer") or result.get("search_answer", "N/A"))
+
+
