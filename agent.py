@@ -68,6 +68,7 @@ class State(TypedDict):
     tool_decision: str # "sql", "tools", or "both"
     eval_decision: str # "final", "sql", or "tools"
     counter: int #to keep track of how many times we have gone thru the loop, to prevent infinite loops
+    sql_retries: int
 
 
 #give the llm context!! in this function, its the only one we use the llm for
@@ -151,9 +152,9 @@ def should_continue(state: State) -> State:
     prompt = f"""The user has asked the question {state["question"]}. Based on the question, and the given schema: {schema}, if you think an answer that addresses all parts of the user's question can be 
         answered from querying the table, return "sql". If you think to completely address the question, you need external info from a web search api call, return "tools". If you think the question needs both, return "both". Only return one of these three options as a string, and nothing else.
         Classify the question:
-- Return "sql" if the ENTIRE question can be answered from the database
-- Return "tools" if the ENTIRE question needs external web search (no dataset info needed at all)
-- Return "both" if ANY part of the question requires the database AND any other part requires external info
+- Return "sql" if the ENTIRE question can be answered from the database (prescription counts, costs, prescriber info, drug names only)
+- Return "tools" if the ENTIRE question needs external web search — this includes drug mechanisms, side effects, drug classes, clinical info, global market data
+- Return "both" if ANY part needs the database AND any other part needs external info
 
 Return only one of: "sql", "tools", "both"
         """
@@ -192,7 +193,7 @@ Errors: { state["val_error_msg"] if state["val_error"] else "None"}
     if sql.startswith("```"):
         sql = sql.split("\n", 1)[1]
         sql = sql.rsplit("```", 1)[0].strip()
-    return {"sql": sql}
+    return {"sql": sql, "sql_retries": state.get("sql_retries", 0) + 1}
 #langgraph is designed to update your state via this dict entry, given the key
 #cannot do state state["sql"] = response, the changes wont persist,need to return those vals
 #cannot init values like this either,to let changes persist, 
@@ -214,8 +215,8 @@ def validate_sql(state: State) -> State:
     return state
 
 def route_edge(state: State) -> str:
-    if state["val_error"] == True:
-        return "generate_sql" #name of node to go to, we want to go back to gen ssql if there an error
+    if state["val_error"] and state.get("sql_retries", 0) < 3:
+        return "generate_sql"
     else:
         return "execute_sql" #if no error, then proceed
 
@@ -364,7 +365,8 @@ if __name__ == "__main__":
             "question": question,
             "val_error": False,
             "val_error_msg": "",
-            "counter": 0
+            "counter": 0,
+            "sql_retries": 0
         }):
             print(list(step.keys()))
             node_output = list(step.values())[0]
