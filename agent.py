@@ -269,7 +269,7 @@ If you think the answer is missing critical info that could be found via either 
         curr_answer = "No answer generated."
         return {"eval_decision": "final", "counter": state["counter"] + 1, "combined_answer": ""} #tech a bug to ever reach this state but for code to not crash just treat as final iteration with no answer
 
-    decision = llm_with_tools.invoke(eval_prompt).content.strip().lower()
+    decision = llm.invoke(eval_prompt).content.strip().lower()
     return {"eval_decision": decision, "counter": state["counter"] + 1, "combined_answer": curr_answer}
 def e(state: State) -> State:
     return state["eval_decision"]
