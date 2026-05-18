@@ -70,6 +70,7 @@ class State(TypedDict):
     counter: int #to keep track of how many times we have gone thru the loop, to prevent infinite loops
     sql_retries: int
     past_messages: list
+    chat_answer: str
 
 #give the llm context!! in this function, its the only one we use the llm for
 #use an f string for the context so its easier to give prompt as one long string since f string lets u insert dynamic varss as {x} inside the string
@@ -149,19 +150,23 @@ Total number of beneficiaries/patients age 65 and older.
 def classify_question(state: State) -> State:
     return {}
 def should_continue(state: State) -> State:
-    prompt = f"""The user has asked the question {state["question"]}. Based on the question, and the given schema: {schema}, if you think an answer that addresses all parts of the user's question can be 
+    prompt = f"""You are a helpful pharmaceutical business analyst conversational assistant, interpret things unless explicitly asked not to in that context. The user has asked the question {state["question"]}. Based on the question, and the given schema: {schema}, if you think an answer that addresses all parts of the user's question can be 
         answered from querying the table, return "sql". If you think to completely address the question, you need external info from a web search api call, return "tools". If you think the question needs both, return "both". Only return one of these three options as a string, and nothing else.
         Classify the question:
 - Return "sql" if the ENTIRE question can be answered from the database (prescription counts, costs, prescriber info, drug names only)
 - Return "tools" if the ENTIRE question needs external web search — this includes drug mechanisms, side effects, drug classes, clinical info, global market data
 - Return "both" if ANY part needs the database AND any other part needs external info
-If the question references past messages in chat, use the context here: {state["past_messages"]}. 
-               The format is "Question:" and then the following "Answer:" is its correpsonding answer, in pairs
-Return only one of: "sql", "tools", "both"
+- Return "both" if the question requires knowing what a drug treats/does (external knowledge) AND finding it in the dataset
+- Return "both" if the question asks about dataset metrics AND ALSO mentions reviews, recommendations, clinical guidelines, external context, or anything online
+- Return "chat" if the question is conversational, a greeting, a follow-up that needs no data, or answerable purely from the prior chat context  {state["past_messages"]}, and general LLM knowledge with no database or web search needed
+
+Interpret the users current question in the context of the past messages here, in the style of a conversational flow: {state["past_messages"]}.
+
+Return only one of: "sql", "tools", "both", "chat"
         """
     response = llm.invoke(prompt)
-    answer = response.content.strip().lower()
-    if answer not in ["sql", "tools", "both"]:
+    answer = response.content.strip().lower().strip('"').strip("'")
+    if answer not in ["sql", "tools", "both", "chat"]:
         answer = "both"
     return answer
 
@@ -172,14 +177,14 @@ def generate_sql(state: State) -> State:
     #you can access parts of state by indexing it, but you cant update the fields just by indexing
     query = state["question"] #our query is the question field in the state typeddict
     prompt = f"""
-    You are a helpful pharmaceutical business analyst SQL assistant, turning natural language into SQL.
+    You are a helpful pharmaceutical business analyst SQL assistant, turning natural language into SQL. You are a helpful pharmaceutical business analyst, interpret things unless explicitly asked not to in that context
     Only answer parts that you believe are answerable based on the dataset of the following schema: {schema}. If a part of the question is not answerable based on that dataset, ignore that part and do not include it in the SQL query. Only generate SQL for the parts of the question that are answerable with the given dataset.
 Business definitions:
 - TRx means total prescriptions. In this dataset, use SUM(tot_clms) as TRx.
 - TRx share means drug TRx divided by total TRx in the selected comparison set.
 - NBRx cannot be calculated from this dataset because patient-level new-to-brand history is unavailable.
-If the question references past messages in chat, use the context here: {state["past_messages"]}. 
-               The format is "Question:" and then the following "Answer:" is its correpsonding answer, in pairs
+Interpret the users current question in the context of the past messages here, in the style of a conversational flow: {state["past_messages"]}. 
+
 Rules:
 - Only use table partd_prescribers.
 - Only generate SELECT queries.
@@ -230,7 +235,7 @@ def execute_sql(state: State) -> State:
     if not blocks:
         blocks = [q.strip() for q in re.split(r";\s*\n", raw) if q.strip().upper().startswith("SELECT")]
     if not blocks:
-        blocks = [raw]
+        return {"result": "EMPTY_RESULT: The dataset does not contain relevant data to answer this question."}
     combined = ""
     for i, query in enumerate(blocks):
         query = query.strip().rstrip(";")
@@ -240,16 +245,19 @@ def execute_sql(state: State) -> State:
    #just the key value of the part we want to return, langgrpah is designed to update ur state if you just give it this
 def generate_answer(state: State) -> State:
     result = state["result"]
-    prompt = f"""You are a helpful pharmaceutical business analyst SQL assistant, summarize the answer
+    prompt = f"""You are a helpful pharmaceutical business analyst SQL assistant conversational assistant, summarize the answer
     to the question given below (denoted by 'Question: '), using the results from the following table denoted by 'Table: '.
     into natural language.
     The SQL query used to get the resulting table is: {state["sql"]}
     Mention that tot_clms is being used to infer TRx, if needed.
-- Focus only on the parts of the question answerable from this dataset
+- Focus ONLY on the actual values returned in the Table above — do not use any outside clinical or medical knowledge
+- Only reference column names and values that appear in the query result (e.g. Tot_Clms, Tot_Drug_Cst, Tot_Benes)
 - Do not attempt to answer parts requiring external data
 - If the table is empty or has no results, say exactly: "EMPTY_RESULT: The dataset does not contain relevant data to answer this question."
     Question: {state["question"]}
     Table: {state["result"]}
+Interpret the users current question in the context of the past messages here, in the style of a conversational flow: {state["past_messages"]}. 
+
 """
     response = llm.invoke(prompt)
     print("sql \n")
@@ -258,13 +266,13 @@ def generate_answer(state: State) -> State:
 #nodes: each is a function that takes in state and outputs state, they can modify any part of the state
 #define graph w nodes
 def search_call(state: State) -> State:
-    search_query = llm.invoke(f"Convert the web-searchable part of this question into a SHORT search query of under 50 words. Return ONLY the search query, no explanation, no answer: {state['question']}").content.strip()
+    search_query = llm.invoke(f"Convert the web-searchable part of this question into a SHORT specific search query of under 50 words. Use the conversation history to resolve any references like 'this drug' or 'it'. Conversation history: {state['past_messages']}. Return ONLY the search query, no explanation, no answer: {state['question']}").content.strip()
     response = tavily_search.invoke(search_query)
-    answer = llm.invoke(f"""The user has asked the question {state["question"]}.
+    answer = llm.invoke(f"""You are a helpful pharmaceutical business analyst conversational assistant, interpret things unless explicitly asked not to, in that context. The user has asked the question {state["question"]}.
                 Based on the question, and the given search results:
                {response}, turn this into natural language answer to the user's question. Only use the search results given, and do not make up any info that is not in the search results. If the search results do not have relevant info to answer the question, say "Based on the search results, I could not find relevant info to answer the question. 
-               If the question references past messages in chat, use the context here: {state["past_messages"]}. 
-               The format is "Question:" and then the following "Answer:" is its correpsonding answer, in pairs" """)
+               Interpret the users current question in the context of the past messages here, in the style of a conversational flow: {state["past_messages"]}. 
+ """)
     print("Search query:", search_query)
     print("Tavily response:", str(response)[:300])
     print("Tavily response:", str(response)[:300])
@@ -275,75 +283,118 @@ def search_call(state: State) -> State:
 def evaluate(state: State) -> State:
     curr_answer = ""
     if state["counter"] > counter_limit:
-        return {"eval_decision": "final"}
+        sql_ans = state.get("answer", "")
+        has_sql = bool(sql_ans) and "EMPTY_RESULT" not in sql_ans
+        has_search = bool(state.get("search_answer"))
+        if has_sql and has_search:
+            forced_answer = state["search_answer"] + " " + sql_ans
+        elif has_sql:
+            forced_answer = sql_ans
+        elif has_search:
+            forced_answer = state["search_answer"]
+        else:
+            forced_answer = ""
+        return {"eval_decision": "final", "combined_answer": forced_answer}
     if state.get("answer") and "EMPTY_RESULT" in state["answer"]:
         return {"eval_decision": "tools", "counter": state["counter"] + 1}
     sql_answer = state.get("answer", "")
     has_sql = bool(sql_answer) and "EMPTY_RESULT" not in sql_answer
     has_search = bool(state.get("search_answer"))
+    has_chat = bool(state.get("chat_answer"))
     if has_search and has_sql:
-        curr_answer = state["search_answer"] + " " + sql_answer
-        eval_prompt = f"""The user has asked the question {state["question"]}.
-Here are two potential answers to the user's question, one based on querying the database of schema: {schema} and one based on using web search tools:
-Answer based on database query results: {state["answer"] if state["answer"] else ""}
-Answer based on web search results: {state["search_answer"] if state["search_answer"] else ""}   
+        curr_answer = state["search_answer"] + " " + sql_answer + " " + state.get("chat_answer", "")
+        eval_prompt = f"""You are a helpful pharmaceutical business analyst conversational assistant, interpret things unless explicitly asked not to, in that context. The user has asked the question {state["question"]}.
+Here are 3 potential answers to the user's question, one based on querying the database of schema: {schema} and one based on using web search tools:
+Answer based on database query results: {state["answer"] if state["answer"] else "None"}
+Answer based on web search results: {state["search_answer"] if state["search_answer"] else "None"}
+Answer based on conversational context: {state["chat_answer"] if state.get("chat_answer") else "None"}     
+Interpret the users current question in the context of the past messages here, in the style of a conversational flow: {state["past_messages"]}. 
 If you believe the combined answer {curr_answer} is accurate and complete, return "final". 
 If you think the answer has not completely addressed all parts of the user's question or is missing critical info that could be found via either further querying the aforementioned database of schema: {schema}, return "sql". If you think the answer is missing critical info that could be found via using web search tools, return "tools". Only return one of these 3 options as a string, and nothing else.
 Criteria: Does this answer FULLY address every part of the user's question?
 - If any part of the question requires information not in the database (global data, clinical info, external context), you MUST return "tools"
-- If more specific database (of aforementioned schema) querying would help, return "sql"  
+- If the question mentions "reviews", "online", "recommendations from external sources", "clinical guidelines", or anything requiring web search, you MUST return "tools"
+- If more specific database (of aforementioned schema) querying would help, return "sql"
+- If the question is conversational, a greeting, a follow-up that needs no data, or answerable purely from the prior chat context, return "chat"
 - ONLY return "final" if every part of the question is completely answered
  a partial answer is not sufficient, if any part of the question is not answered, then answer is not complete and you should not return final.
-If the question references past messages in chat, use the context here: {state["past_messages"]}. 
-               The format is "Question:" and then the following "Answer:" is its correpsonding answer, in pairs
  """
     elif has_search:
-         eval_prompt = f"""The user has asked the question {state["question"]}.
-Answer based on web search results: {state["search_answer"] if state["search_answer"] else ""}   
+         eval_prompt = f"""You are a helpful pharmaceutical business analyst, interpret things unless explicitly asked not to, in that context. The user has asked the question {state["question"]}.
+Answer based on web search results: {state["search_answer"] if state["search_answer"] else ""}
+Interpret the users current question in the context of the past messages here, in the style of a conversational flow: {state["past_messages"]}.    
 If you believe the combined answer is accurate and complete, return "final". 
 If you think the answer has not completely addressed all parts of the user's question or is missing critical info that could be found via either querying the database of schema: {schema}, return "sql". If you think the answer is missing critical info that could be found via further using web search tools, return "tools". Only return one of these 3 options as a string, and nothing else.
 Criteria: Does this answer FULLY address every part of the user's question?
 - If any part of the question requires information not in the database (global data, clinical info, external context), you MUST return "tools"
-- If more specific database (of aforementioned schema) querying would help, return "sql"  
+- If the question mentions "reviews", "online", "recommendations from external sources", "clinical guidelines", or anything requiring web search, you MUST return "tools"
+- If more specific database (of aforementioned schema) querying would help, return "sql"
+- If the question is conversational, a greeting, a follow-up that needs no data, or answerable purely from the prior chat context, return "chat"
 - ONLY return "final" if every part of the question is completely answered.
  a partial answer is not sufficient, if any part of the question is not answered, then answer is not complete and you should not return final.
-If the question references past messages in chat, use the context here: {state["past_messages"]}. 
-               The format is "Question:" and then the following "Answer:" is its correpsonding answer, in pairs
- """   
+"""
     elif has_sql:
-         eval_prompt = f"""The user has asked the question {state["question"]}.
+         eval_prompt = f"""You are a helpful pharmaceutical business analyst, interpret things unless explicitly asked not to, in that context. The user has asked the question {state["question"]}.
 Answer based on database query results: {state["answer"] if state["answer"] else ""} 
+Interpret the users current question in the context of the past messages here, in the style of a conversational flow: {state["past_messages"]}. 
+If you believe the combined answer is accurate and complete, return "final". 
+If you think the answer has not completely addressed all parts of the user's question or is missing critical info that could be found via either further querying the aforementioned database of schema: {schema}, return "sql". If you think the answer is missing critical info that could be found via using web search tools, return "tools". Only return one of these 3 options as a string, and nothing else.
+Criteria: Does this answer FULLY address every part of the user's question?
+- If any part of the question requires information not in the database (global data, clinical info, external context), you MUST return "tools"
+- If the question mentions "reviews", "online", "recommendations from external sources", "clinical guidelines", or anything requiring web search, you MUST return "tools"
+- If more specific database (of aforementioned schema) querying would help, return "sql"
+- If the question is conversational, a greeting, a follow-up that needs no data, or answerable purely from the prior chat context, return "chat"
+- ONLY return "final" if every part of the question is completely answered
+ a partial answer is not sufficient, if any part of the question is not answered, then answer is not complete and you should not return final.
+"""
+    elif has_chat:
+         eval_prompt = f"""You are a helpful pharmaceutical business analyst, interpret things unless explicitly asked not to, in that context. The user has asked the question {state["question"]}.
+Answer based on chat: {state["chat_answer"] if state["chat_answer"] else ""} 
+Interpret the users current question in the context of the past messages here, in the style of a conversational flow: {state["past_messages"]}. 
 If you believe the combined answer is accurate and complete, return "final". 
 If you think the answer has not completely addressed all parts of the user's question or is missing critical info that could be found via either further querying the aforementioned database of schema: {schema}, return "sql". If you think the answer is missing critical info that could be found via using web search tools, return "tools". Only return one of these 3 options as a string, and nothing else.
 Criteria: Does this answer FULLY address every part of the user's question?
 - If any part of the question requires information not in the database (global data, clinical info, external context), you MUST return "tools"
 - If more specific database (of aforementioned schema)querying would help, return "sql"  
+- If the question is conversational, a greeting, a follow-up that needs no data, or answerable purely from the prior chat context, return "chat"
 - ONLY return "final" if every part of the question is completely answered
  a partial answer is not sufficient, if any part of the question is not answered, then answer is not complete and you should not return final.
-If the question references past messages in chat, use the context here: {state["past_messages"]}. 
-               The format is "Question:" and then the following "Answer:" is its correpsonding answer, in pairs
- """
+
+"""
     else:
         curr_answer = "No answer generated."
         return {"eval_decision": "final", "counter": state["counter"] + 1, "combined_answer": ""} #tech a bug to ever reach this state but for code to not crash just treat as final iteration with no answer
 
-    decision = llm.invoke(eval_prompt).content.strip().lower()
+    decision = llm.invoke(eval_prompt).content.strip().lower().strip('"').strip("'")
     return {"eval_decision": decision, "counter": state["counter"] + 1, "combined_answer": curr_answer}
 def e(state: State) -> State:
     return state["eval_decision"]
 def combine_answers(state: State) -> State:
     if state.get("answer") and state.get("search_answer") and state.get("combined_answer"):
-        prompt = f"""The user has asked the question {state["question"]}. The answer is currently {state.get("combined_answer")}. If you had to combine the SQL-based answer and the tool-based answer into one final answer to the user, how would you combine them?
-Combine the following two pieces of information into one final answer to the user's question. If you think one answer is more relevant to the user's question, prioritize that answer in the combined answer. If both answers have relevant info, combine the two answers in a way that is coherent and useful to the user. If one answer is not relevant and the other is, just give the relevant answer as the final answer. If neither answer is relevant, say "Based on the search results and the database query results. You can also trim parts of the answer if they are redundant or not useful. Do not just give a list of the two answers, but actually combine them into one final answer in natural language.
-If the question references past messages in chat, use the context here: {state["past_messages"]}. 
-               The format is "Question:" and then the following "Answer:" is its correpsonding answer, in pairs
+        prompt = f"""You are a helpful pharmaceutical business analyst. The user has asked: {state["question"]}
+Dataset answer (from Medicare Part D prescriber data — only contains prescription counts, costs, beneficiaries, prescriber info):
+{state.get("answer", "")}
+External search answer (from web search — may contain clinical info, reviews, global data):
+{state.get("search_answer", "")}
+Combine these into one final answer. Critical rules:
+- Never present external/clinical data as if it came from the dataset
+- When referencing dataset facts (claims, costs, beneficiaries), make clear it is from the dataset
+- When referencing clinical or external info (efficacy, reviews, mechanisms), make clear it is from external sources
+- If one source is not relevant to the question, omit it
+- Do not just list both answers — synthesize them into a coherent natural language response
+Conversation history: {state["past_messages"]}
 """
         response = llm.invoke(prompt)
         response = response.content.strip()
-        return {"combined_answer": response, "past_messages": state.get("past_messages",[]) + [f"""Question: {state['question']} \n Answer: {response}"""]}
+        return {"combined_answer": response}
     else:
         return {}
-
+def talk_with_chat(state: State) -> State:
+    prompt = f"""You are a helpful pharmaceutical business analyst conversational assistant, interpret things unless explicitly asked not to in that context. The user has asked the question {state["question"]}. This is a conversational question that does not require any database querying or web search tools to answer, but is more of a follow-up, greeting, or general conversational question. Answer the question based on the context of the conversation so far, which is here: {state["past_messages"]}. 
+               
+"""
+    response = llm.invoke(prompt)
+    return {"chat_answer": response.content.strip()}
 graph_builder = StateGraph(State)
 graph_builder.add_node("classify", classify_question) 
 graph_builder.add_node("tools", search_call) 
@@ -353,15 +404,18 @@ graph_builder.add_node("execute_sql", execute_sql)
 graph_builder.add_node("generate_answer", generate_answer)
 graph_builder.add_node("eval", evaluate)
 graph_builder.add_node("combine", combine_answers)
+graph_builder.add_node("chat", talk_with_chat)
+
 #edges=where execution goes next after a node finishes. need a start and end edge, no start end node tho
 graph_builder.add_edge(START, "classify")
-graph_builder.add_conditional_edges("classify", should_continue, {"sql": "generate_sql", "tools": "tools", "both": "generate_sql"})
+graph_builder.add_conditional_edges("classify", should_continue, {"sql": "generate_sql", "tools": "tools", "both": "generate_sql", "chat": "chat"}) 
 graph_builder.add_edge("generate_sql", "validate_sql")
 graph_builder.add_conditional_edges("validate_sql", route_edge)
 graph_builder.add_edge("execute_sql", "generate_answer")    
 graph_builder.add_edge("generate_answer", "eval") 
 graph_builder.add_edge("tools", "eval") 
-graph_builder.add_conditional_edges("eval", e, {"sql": "generate_sql", "tools": "tools", "final": "combine"})
+graph_builder.add_edge("chat", "eval")
+graph_builder.add_conditional_edges("eval", e, {"sql": "generate_sql", "tools": "tools", "chat": "chat", "final": "combine"})
 graph_builder.add_edge("combine", END) 
 #nodes have function and name, edges have beginning node and destination node, loops and conditional edges are allowed
 #graphs are collectin of edges and nodes, they define the flow of execution, they are like a blueprint for how agent proceses input and outputs final result
@@ -371,6 +425,7 @@ graph = graph_builder.compile() #compiling turns it into an executable graph, we
 
 #graph.invoke is qhat actually runs the compiled graph in  the order we define nodes via edges
 if __name__ == "__main__":
+    past_messages = []
     question = input("User query: ")
     while question != "quit":
         result = {}
@@ -379,7 +434,7 @@ if __name__ == "__main__":
             "val_error": False,
             "val_error_msg": "",
             "counter": 0,
-            "sql_retries": 0
+            "sql_retries": 0, "past_messages": past_messages
         }):
             print(list(step.keys()))
             node_output = list(step.values())[0]
@@ -389,8 +444,9 @@ if __name__ == "__main__":
         sql_ans = result.get("answer", "")
         final = (result.get("combined_answer") or
                  (sql_ans if "EMPTY_RESULT" not in sql_ans else "") or
-                 result.get("search_answer", "N/A"))
+                 result.get("search_answer") or result.get("chat_answer"))
         print("Final answer:", final)
+        past_messages.append(f"Question: {question}\nAnswer: {final}")
         question = input("User query: ")
 
 
